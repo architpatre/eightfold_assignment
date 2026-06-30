@@ -1,0 +1,19 @@
+{
+  "candidate": {
+    "first_name": "Johnathan",
+    "last_name": "Doe",
+    "location": "San Francisco, USA",
+    "contact": {
+      "email": "johndoe@example.com",
+      "phone": "(510) 555-0192"
+    },
+    "employment_history": [
+      {
+        "company_name": "TechCorp",
+        "job_title": "Software Engineer II",
+        "start_date": "2023-01-15",
+        "end_date": "Present"
+      }
+    ]
+  }
+}

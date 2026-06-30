@@ -1,0 +1,7 @@
+{
+  "name": "John Doe",
+  "email": "johndoe@example.com",
+  "login": "johndoe_dev",
+  "bio": "Building scalable backend systems in Python and Go.",
+  "top_languages": ["Python", "Go", "React.js"]
+}
