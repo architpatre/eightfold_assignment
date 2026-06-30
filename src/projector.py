@@ -88,19 +88,38 @@ class ProfileProjector:
                 elif self.on_missing == "null":
                     output[target_key] = None
             else:
-                # If it's a Pydantic model (like the full FieldContainer), convert to dict
+                # Convert Pydantic models to plain data (support v2 `.model_dump` and v1 `.dict`)
                 if hasattr(value, "model_dump"):
-                    output[target_key] = value.model_dump()
-                elif isinstance(value, list):
-                    # Clean up nested Pydantic models in arrays (like Experience)
-                    output[target_key] = [
-                        item.model_dump() if hasattr(item, "model_dump") else item 
-                        for item in value
-                    ]
-                elif isinstance(value, set):
-                    output[target_key] = list(value)
+                    dumped = value.model_dump()
+                elif hasattr(value, "dict"):
+                    dumped = value.dict()
                 else:
-                    output[target_key] = value
+                    dumped = value
+
+                # Special-case: skills stored internally as a dict of SkillField
+                # Convert to an array of {name, confidence, sources[]} for external output
+                if isinstance(dumped, dict) and all(isinstance(v, dict) and "name" in v for v in dumped.values()):
+                    output[target_key] = [v for k, v in dumped.items()]
+                    continue
+
+                if isinstance(dumped, list):
+                    # Clean up nested Pydantic models in arrays (like Experience)
+                    cleaned = []
+                    for item in dumped:
+                        if hasattr(item, "model_dump"):
+                            cleaned.append(item.model_dump())
+                        elif hasattr(item, "dict"):
+                            cleaned.append(item.dict())
+                        else:
+                            cleaned.append(item)
+                    output[target_key] = cleaned
+                    continue
+
+                if isinstance(dumped, set):
+                    output[target_key] = list(dumped)
+                    continue
+
+                output[target_key] = dumped
 
         # Attach overall profile confidence if requested globally
         if self.include_confidence:

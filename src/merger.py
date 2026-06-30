@@ -1,10 +1,11 @@
 import re
 from typing import List, Dict, Any, Tuple
+import difflib
 from collections import defaultdict
 from uuid import uuid4
 
 # Import from our previous modules
-from schema import CanonicalProfile, FieldContainer, ProvenanceMetadata, Location, Links, Experience
+from schema import CanonicalProfile, FieldContainer, ProvenanceMetadata, Location, Links, Experience, SkillField, ProvenanceRecord
 from normalizers import Normalizer
 
 # Source authority weights defined in the technical design
@@ -23,35 +24,87 @@ class CandidateMerger:
     """
 
     def __init__(self):
-        # Maps a normalized email to a unique candidate UUID
-        self.email_to_id: Dict[str, str] = {}
+        # Maps any normalized identity key to a unique candidate UUID
+        self.key_to_id: Dict[str, str] = {}
+        # Stores candidate roots for transitive merges
+        self.parent: Dict[str, str] = {}
         # Stores tuples grouped by their assigned UUID
         self.grouped_records: Dict[str, List[Tuple[str, Any, str, str]]] = defaultdict(list)
+
+    def _find_root(self, candidate_id: str) -> str:
+        if self.parent[candidate_id] != candidate_id:
+            self.parent[candidate_id] = self._find_root(self.parent[candidate_id])
+        return self.parent[candidate_id]
+
+    def _union_ids(self, first_id: str, second_id: str) -> str:
+        root_a = self._find_root(first_id)
+        root_b = self._find_root(second_id)
+        if root_a == root_b:
+            return root_a
+
+        winner = root_a if root_a < root_b else root_b
+        loser = root_b if winner == root_a else root_a
+        self.parent[loser] = winner
+        self.grouped_records[winner].extend(self.grouped_records.pop(loser, []))
+        return winner
+
+    def _normalize_identity_key(self, path: str, value: Any) -> List[str]:
+        if not value:
+            return []
+
+        if path == "emails":
+            return [f"email:{str(value).strip().lower()}"]
+        if path == "phones":
+            normalized = Normalizer.normalize_phone(value)
+            return [f"phone:{normalized}"] if normalized else []
+        if path == "full_name":
+            name = re.sub(r"\s+", " ", str(value).strip().lower())
+            return [f"name:{name}"]
+
+        return []
+
+    def _match_fuzzy_name(self, candidate_names: List[str]) -> str:
+        existing_name_keys = [key for key in self.key_to_id.keys() if key.startswith("name:")]
+        for name in candidate_names:
+            close = difflib.get_close_matches(name, existing_name_keys, n=1, cutoff=0.8)
+            if close:
+                return close[0]
+        return ""
 
     def ingest_tuples(self, records: List[Tuple[str, Any, str, str]]):
         """
         Entity Resolution: Scans records to establish an identity key.
-        In a production system, this would use union-find or graph resolution.
-        Here, we group all incoming tuples by the first normalized email found in the batch.
+        Uses unified key mapping and transitive merge logic so that email,
+        phone, and fuzzy name matches resolve to the same candidate record.
         """
-        batch_id = str(uuid4())
-        primary_email = None
+        found_id = None
+        batch_keys: List[str] = []
+        candidate_names: List[str] = []
 
-        # Pass 1: Hunt for the primary matching key (Email)
         for path, value, _, _ in records:
-            if path == "emails" and value:
-                clean_email = str(value).strip().lower()
-                primary_email = clean_email
-                
-                # If we've seen this email before, link this batch to the existing UUID
-                if clean_email in self.email_to_id:
-                    batch_id = self.email_to_id[clean_email]
-                else:
-                    self.email_to_id[clean_email] = batch_id
-                break
-        
-        # Pass 2: Store all records under the resolved UUID
-        self.grouped_records[batch_id].extend(records)
+            batch_keys.extend(self._normalize_identity_key(path, value))
+            if path == "full_name" and value:
+                candidate_names.extend(self._normalize_identity_key(path, value))
+
+        existing_ids = {self._find_root(self.key_to_id[key]) for key in batch_keys if key in self.key_to_id}
+
+        if not existing_ids and candidate_names:
+            fuzzy_key = self._match_fuzzy_name(candidate_names)
+            if fuzzy_key and fuzzy_key in self.key_to_id:
+                existing_ids.add(self._find_root(self.key_to_id[fuzzy_key]))
+
+        if existing_ids:
+            found_id = min(existing_ids)
+            for other_id in existing_ids:
+                found_id = self._union_ids(found_id, other_id)
+        else:
+            found_id = str(uuid4())
+            self.parent[found_id] = found_id
+
+        for key in batch_keys:
+            self.key_to_id[key] = found_id
+
+        self.grouped_records[found_id].extend(records)
 
     def _resolve_scalar_conflict(
         self, 
@@ -78,6 +131,56 @@ class CandidateMerger:
         # If lower or equal weight, we reject the value but could append provenance
         # to show corroboration. For this scope, we preserve the highest-trust winner.
         return current_container
+
+    def _record_provenance(self, profile: CanonicalProfile, field_name: str, source: str, method: str):
+        rec = ProvenanceRecord(field=field_name, source=source, method=method)
+        if all(not (r.field == rec.field and r.source == rec.source and r.method == rec.method) for r in profile.provenance):
+            profile.provenance.append(rec)
+
+    def _update_skill(self, profile: CanonicalProfile, raw_skill: str, source: str, method: str):
+        normalized = Normalizer.normalize_skill(raw_skill)
+        if not normalized:
+            return
+
+        weight = SOURCE_WEIGHTS.get(source, 0.0)
+        existing = profile.skills.value.get(normalized)
+        if existing is None:
+            profile.skills.value[normalized] = SkillField(
+                name=normalized,
+                confidence=weight,
+                sources=[ProvenanceMetadata(source=source, method=method)],
+            )
+        else:
+            existing.confidence = max(existing.confidence, weight)
+            if all(not (src.source == source and src.method == method) for src in existing.sources):
+                existing.sources.append(ProvenanceMetadata(source=source, method=method))
+        # Avoid duplicate provenance entries for the skill collection
+        if all(not (p.source == source and p.method == method) for p in profile.skills.provenance):
+            profile.skills.provenance.append(ProvenanceMetadata(source=source, method=method))
+
+    def _update_location(self, profile: CanonicalProfile, raw_location: str, source: str, method: str):
+        normalized = Normalizer.normalize_location(raw_location)
+        if normalized.get("city"):
+            profile.location.city = self._resolve_scalar_conflict(
+                profile.location.city,
+                normalized["city"],
+                source,
+                method,
+            )
+        if normalized.get("region"):
+            profile.location.region = self._resolve_scalar_conflict(
+                profile.location.region,
+                normalized["region"],
+                source,
+                method,
+            )
+        if normalized.get("country"):
+            profile.location.country = self._resolve_scalar_conflict(
+                profile.location.country,
+                normalized["country"],
+                source,
+                method,
+            )
 
     def build_profiles(self) -> List[CanonicalProfile]:
         """
@@ -111,29 +214,37 @@ class CandidateMerger:
                     if norm_val:
                         profile.phones.value.add(norm_val)
                         profile.phones.provenance.append(ProvenanceMetadata(source=source, method=method))
-                        
+                        self._record_provenance(profile, "phones", source, method)
+
                 elif path == "emails":
                     norm_val = str(raw_value).strip().lower()
                     profile.emails.value.add(norm_val)
                     profile.emails.provenance.append(ProvenanceMetadata(source=source, method=method))
-                    
+                    self._record_provenance(profile, "emails", source, method)
+
                 elif path == "skills":
-                    norm_val = Normalizer.normalize_skill(raw_value)
-                    if norm_val:
-                        profile.skills.value.add(norm_val)
-                        profile.skills.provenance.append(ProvenanceMetadata(source=source, method=method))
-                        
+                    self._update_skill(profile, raw_value, source, method)
+                    self._record_provenance(profile, "skills", source, method)
+
+                elif path == "location":
+                    self._update_location(profile, raw_value, source, method)
+                    self._record_provenance(profile, "location", source, method)
+
                 elif path == "full_name":
                     profile.full_name = self._resolve_scalar_conflict(profile.full_name, raw_value, source, method)
-                    
+                    self._record_provenance(profile, "full_name", source, method)
+
                 elif path == "headline":
                     profile.headline = self._resolve_scalar_conflict(profile.headline, raw_value, source, method)
-                    
+                    self._record_provenance(profile, "headline", source, method)
+
                 elif path == "links.github":
                     profile.links.github = self._resolve_scalar_conflict(profile.links.github, raw_value, source, method)
-                    
+                    self._record_provenance(profile, "links.github", source, method)
+
                 elif path == "links.linkedin":
                     profile.links.linkedin = self._resolve_scalar_conflict(profile.links.linkedin, raw_value, source, method)
+                    self._record_provenance(profile, "links.linkedin", source, method)
 
             # Reconstruct Experience Arrays
             for idx, job_data in temp_experience.items():

@@ -76,52 +76,88 @@ class CanonicalEncoder(json.JSONEncoder):
 # Pipeline Orchestrator Execution
 # ---------------------------------------------------------
 def run_pipeline():
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Run the candidate transformer pipeline.")
+    parser.add_argument("--inputs", nargs="+", help="List of input JSON files or strings to process (optional). If omitted, runs built-in demo.")
+    parser.add_argument("--config", help="Optional projection config JSON file")
+    args = parser.parse_args()
+
     print("=== [1] Initializing Extractor Units ===")
     ats_extractor = ATSJSONExtractor()
     github_extractor = GitHubAPIExtractor()
     linkedin_extractor = MockLinkedInExtractor()
 
-    print("\n=== [2] Extracting Messy Inputs into Metadata Tuples ===")
-    tuples_ats = ats_extractor.extract(SAMPLE_ATS_PAYLOAD)
-    tuples_github = github_extractor.extract(SAMPLE_GITHUB_PAYLOAD)
-    tuples_linkedin = linkedin_extractor.extract()
+    records_batches = []
 
-    print(f"-> ATS generated {len(tuples_ats)} tuples.")
-    print(f"-> GitHub generated {len(tuples_github)} tuples.")
-    print(f"-> LinkedIn Mock generated {len(tuples_linkedin)} tuples.")
+    if not args.inputs:
+        print("No input files provided — running demo samples.")
+        tuples_ats = ats_extractor.extract(SAMPLE_ATS_PAYLOAD)
+        tuples_github = github_extractor.extract(SAMPLE_GITHUB_PAYLOAD)
+        tuples_linkedin = linkedin_extractor.extract()
+        records_batches = [tuples_ats, tuples_github, tuples_linkedin]
+    else:
+        for inpath in args.inputs:
+            p = Path(inpath)
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text())
+                except Exception:
+                    data = p.read_text()
+            else:
+                try:
+                    data = json.loads(inpath)
+                except Exception:
+                    data = inpath
 
-    print("\n=== [3] Executing Entity Resolution & Merge Strategy ===")
+            if isinstance(data, dict) and ("name" in data or "login" in data):
+                records_batches.append(github_extractor.extract(data))
+            elif isinstance(data, dict) and ("candidate" in data or "employment_history" in data):
+                records_batches.append(ats_extractor.extract(json.dumps(data)))
+            else:
+                # fallback: treat as unstructured and use the LinkedIn mock extractor
+                records_batches.append(linkedin_extractor.extract())
+
+    print("\n=== [2] Executing Entity Resolution & Merge Strategy ===")
     merger = CandidateMerger()
-    merger.ingest_tuples(tuples_ats)
-    merger.ingest_tuples(tuples_github)
-    merger.ingest_tuples(tuples_linkedin)
+    for batch in records_batches:
+        merger.ingest_tuples(batch)
 
     profiles = merger.build_profiles()
     if not profiles:
         print("Error: No profiles resolved.")
         return
-        
+
     canonical_record = profiles[0]
     print(f"Identity resolved successfully. Assigned Candidate ID: {canonical_record.candidate_id}")
 
-    print("\n=== [4] Output: Full Canonical State (Internal Format) ===")
-    print(json.dumps(canonical_record.model_dump(), cls=CanonicalEncoder, indent=2))
+    print("\n=== [3] Output: Full Canonical State (Internal Format) ===")
+    # Support both pydantic v1 (`.dict`) and v2 (`.model_dump`)
+    try:
+        payload = canonical_record.model_dump()
+    except Exception:
+        payload = canonical_record.dict()
+    print(json.dumps(payload, cls=CanonicalEncoder, indent=2))
 
-    print("\n=== [5] Projecting to Custom Configurations ===")
-    
-    # Run Custom Config 1 (Includes mapped entries, sets, and confidence telemetry)
-    projector_1 = ProfileProjector(CUSTOM_CONFIG_1)
-    output_1 = projector_1.project(canonical_record)
-    print("\n--- Projected Profile (Config 1: Technical Summary) ---")
-    # FIX: Pass the CanonicalEncoder to serialize nested sets inside the model dict
-    print(json.dumps(output_1, cls=CanonicalEncoder, indent=2))
+    if args.config:
+        cfg_path = Path(args.config)
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except Exception as e:
+            print(f"Failed to load config: {e}")
+            cfg = None
 
-    # Run Custom Config 2 (Aggressive pruning, omitted empty entries)
-    projector_2 = ProfileProjector(CUSTOM_CONFIG_2)
-    output_2 = projector_2.project(canonical_record)
-    print("\n--- Projected Profile (Config 2: Minimal Role Traversal) ---")
-    # FIX: Pass the CanonicalEncoder for safety across any complex config variation
-    print(json.dumps(output_2, cls=CanonicalEncoder, indent=2))
+        if cfg:
+            try:
+                projector = ProfileProjector(cfg)
+                output = projector.project(canonical_record)
+                print("\n--- Projected Profile (Custom Config) ---")
+                print(json.dumps(output, cls=CanonicalEncoder, indent=2))
+            except ConfigurationError as e:
+                print(f"Configuration error: {e}")
+    else:
+        print("No projection config provided — skipping projection step.")
 
 if __name__ == "__main__":
     run_pipeline()

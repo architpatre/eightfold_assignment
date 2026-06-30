@@ -1,16 +1,19 @@
 import re
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 from dateutil import parser
 import phonenumbers
 
-# Static mapping for scoped location normalization (Edge case handling)
-COUNTRY_MAP = {
+# Static mapping for location normalization and country ISO codes
+COUNTRY_MAP: Dict[str, str] = {
     "united states": "US",
     "usa": "US",
     "us": "US",
     "india": "IN",
     "uk": "GB",
-    "united kingdom": "GB"
+    "united kingdom": "GB",
+    "germany": "DE",
+    "canada": "CA",
+    "australia": "AU"
 }
 
 class Normalizer:
@@ -24,63 +27,77 @@ class Normalizer:
         """
         if not raw_phone:
             return None
-            
+
         try:
-            # Parse the number, assuming the candidate_country as the default region
             parsed_number = phonenumbers.parse(raw_phone, candidate_country)
-            
-            # Check if it's a valid number before formatting
             if phonenumbers.is_valid_number(parsed_number):
-                return phonenumbers.format_number(
-                    parsed_number, 
-                    phonenumbers.PhoneNumberFormat.E164
-                )
+                return phonenumbers.format_number(parsed_number, phonenumbers.PhoneNumberFormat.E164)
         except phonenumbers.NumberParseException:
-            pass # Fallthrough to return None if completely unparsable
-            
+            return None
+
         return None
 
     @staticmethod
     def normalize_date(raw_date: str) -> Tuple[Optional[str], bool]:
         """
-        Parses varying date formats to ISO YYYY-MM. 
+        Parses varying date formats to ISO YYYY-MM.
         Returns a tuple: (normalized_date_string, is_current_boolean)
         """
         if not raw_date:
             return None, False
 
         clean_date = raw_date.strip().lower()
-        
-        if clean_date in ["present", "current", "now"]:
-            return None, True # It is a current role, no strict end date
+        if clean_date in {"present", "current", "now", "today"}:
+            return None, True
 
         try:
-            # fuzzy=True allows the parser to ignore extraneous text
             parsed_date = parser.parse(clean_date, fuzzy=True)
             return parsed_date.strftime("%Y-%m"), False
         except (ValueError, TypeError):
             return None, False
 
     @staticmethod
-    def normalize_location_country(raw_location: str) -> Optional[str]:
+    def normalize_location(raw_location: str) -> Dict[str, Optional[str]]:
         """
-        Maps raw location text to ISO-3166 alpha-2 codes.
-        Scope is limited to exact dict matching for this assignment.
+        Splits a raw location string into city, region, and country codes.
         """
         if not raw_location:
+            return {"city": None, "region": None, "country": None}
+
+        clean_location = raw_location.strip()
+        tokens = [token.strip() for token in re.split(r"[,|;-]", clean_location) if token.strip()]
+        country_code = None
+        city = None
+        region = None
+
+        if tokens:
+            if len(tokens) == 1:
+                city = tokens[0]
+            elif len(tokens) == 2:
+                city, country_token = tokens
+                country_code = Normalizer.normalize_country_code(country_token)
+            else:
+                city, region, country_token = tokens[0], tokens[1], tokens[-1]
+                country_code = Normalizer.normalize_country_code(country_token)
+
+        if not country_code:
+            country_code = Normalizer.normalize_country_code(clean_location)
+
+        return {"city": city, "region": region, "country": country_code}
+
+    @staticmethod
+    def normalize_country_code(raw_country: str) -> Optional[str]:
+        if not raw_country:
             return None
-            
-        clean_loc = raw_location.strip().lower()
-        
-        # Check if the raw string directly matches a known alias
-        if clean_loc in COUNTRY_MAP:
-            return COUNTRY_MAP[clean_loc]
-            
-        # Fallback: check if a known country name is *inside* the string (e.g., "San Francisco, USA")
-        for key, code in COUNTRY_MAP.items():
-            if key in clean_loc:
-                return code
-                
+
+        clean_country = raw_country.strip().lower()
+        if clean_country in COUNTRY_MAP:
+            return COUNTRY_MAP[clean_country]
+
+        for key, iso in COUNTRY_MAP.items():
+            if key in clean_country:
+                return iso
+
         return None
 
     @staticmethod
@@ -91,16 +108,26 @@ class Normalizer:
         """
         if not raw_skill:
             return None
-            
-        # Lowercase and strip whitespace
+
         skill = raw_skill.strip().lower()
-        
-        # Remove common suffixes that cause duplication
-        skill = re.sub(r'(\.js|-js|js)$', '', skill)
-        
-        # Strip all remaining non-alphanumeric characters (e.g., C++ -> c, Node.js -> node)
-        # Note: For a production system, 'C++' needs special handling, but for this scoped 
-        # assignment, strict alphanumeric reduction is a defensible baseline.
-        skill = re.sub(r'[^a-z0-9]', '', skill)
-        
-        return skill if skill else None
+        skill = re.sub(r"(\.js|-js|js)$", "", skill)
+        skill = re.sub(r"[^a-z0-9\+#+ ]", "", skill)
+        skill = re.sub(r"\s+", " ", skill).strip()
+
+        if not skill:
+            return None
+
+        # Normalize some known variants
+        skill_map = {
+            "reactjs": "react",
+            "react": "react",
+            "nodejs": "node",
+            "node": "node",
+            "c++": "c++",
+            "python": "python",
+            "golang": "go",
+            "js": "javascript",
+        }
+
+        canonical = skill_map.get(skill, skill)
+        return canonical if canonical else None
